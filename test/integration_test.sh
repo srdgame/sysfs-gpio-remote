@@ -34,7 +34,7 @@ sim_cleanup() {
     [ -e "$dir/live" ] && echo 0 > "$dir/live" 2>/dev/null
     sleep 0.5   # let the kernel tear down the platform device
     local bank="$dir/$SIM_BANK"
-    rmdir "$bank"/line17 "$bank"/line27 2>/dev/null
+    rmdir "$bank"/line17 "$bank"/line27 "$bank"/line18 2>/dev/null
     rmdir "$bank" 2>/dev/null
     rmdir "$dir" 2>/dev/null
 }
@@ -83,6 +83,9 @@ mkdir "$SIM_DIR/$SIM_BANK/line17"
 echo "GPIO17" > "$SIM_DIR/$SIM_BANK/line17/name"
 mkdir "$SIM_DIR/$SIM_BANK/line27"
 echo "GPIO27" > "$SIM_DIR/$SIM_BANK/line27/name"
+# third line named like an OpenWrt gpio-export pin (named-export tests)
+mkdir "$SIM_DIR/$SIM_BANK/line18"
+echo "pcie_on" > "$SIM_DIR/$SIM_BANK/line18/name"
 echo 1 > "$SIM_DIR/live" || { echo "ERROR: cannot instantiate gpio-sim"; exit 2; }
 
 # locate the sim gpiochip sysfs dir by its per-line pull attributes
@@ -216,6 +219,59 @@ echo 27 > "$MNT/unexport"
 check "gpio27 dir gone"                bash -c "! ls $MNT/gpio27 >/dev/null 2>&1"
 echo 17 > "$MNT/unexport"
 check "gpio17 dir gone"                bash -c "! ls $MNT/gpio17 >/dev/null 2>&1"
+
+# ---------------------------------------------------------------- test 10: named export
+echo "--- named export ---"
+echo pcie_on > "$MNT/export"
+check "pcie_on dir appears"            bash -c "ls $MNT/pcie_on | grep -qx value"
+check "pcie_on direction usable"       bash -c "echo out > $MNT/pcie_on/direction && [ \"\$(cat $MNT/pcie_on/direction)\" = out ]"
+echo 1 > "$MNT/pcie_on/value"
+check "pcie_on value 1"                bash -c "[ \"\$(cat $MNT/pcie_on/value)\" = 1 ]"
+check "named unexport works"           bash -c "echo pcie_on > $MNT/unexport && ! ls $MNT/pcie_on >/dev/null 2>&1"
+
+# ---------------------------------------------------------------- test 11: connect-time enumeration
+echo "--- connect enumeration ---"
+echo 17 > "$MNT/export"
+echo out > "$MNT/gpio17/direction"
+echo 1 > "$MNT/gpio17/value"
+echo 27 > "$MNT/export"
+echo out > "$MNT/gpio27/direction"
+echo 1 > "$MNT/gpio27/value"
+# kill only the client: the server keeps its exports, a fresh client must
+# recover the view via MSG_REQ_LIST
+kill "$CLIENT_PID"; CLIENT_PID=""
+wait "$CLIENT_PID" 2>/dev/null
+sleep 1
+"$ROOT/gpio-remote-client" -s 127.0.0.1 -p "$PORT" -n 64 -v "$MNT" \
+    >> /tmp/gpio-remote-client.log 2>&1 &
+CLIENT_PID=$!
+sleep 2
+kill -0 "$CLIENT_PID" 2>/dev/null || { echo "ERROR: restarted client died, see /tmp/gpio-remote-client.log"; tail -5 /tmp/gpio-remote-client.log; exit 2; }
+check "gpio17 restored via LIST"       bash -c "ls $MNT/gpio17 >/dev/null 2>&1"
+check "gpio27 restored via LIST"       bash -c "ls $MNT/gpio27 >/dev/null 2>&1"
+check "gpio17 value correct"           bash -c "[ \"\$(cat $MNT/gpio17/value)\" = 1 ]"
+check "gpio27 value correct"           bash -c "[ \"\$(cat $MNT/gpio27/value)\" = 1 ]"
+
+# ---------------------------------------------------------------- test 12: sysfs auto-mirror
+echo "--- auto mirror ---"
+FAKE="$(mktemp -d /tmp/gpio-remote-fake.XXXXXX)"
+mkdir "$FAKE/ap_reset"
+echo 1 > "$FAKE/ap_reset/value"
+chmod 0444 "$FAKE/ap_reset/value"      # OpenWrt input-only pin style
+# restart the server with a fake sysfs dir; the running client must
+# reconnect and pick up the mirrored entry automatically
+kill "$SERVER_PID"; SERVER_PID=""
+wait "$SERVER_PID" 2>/dev/null
+for i in $(seq 1 20); do
+    grep -qs ":$PORT " /proc/net/tcp && sleep 0.25 || break
+done
+GPIO_REMOTE_SYSFS_DIR="$FAKE" "$ROOT/gpio-remote-server" -p "$PORT" -n 64 -vv \
+    >> /tmp/gpio-remote-server.log 2>&1 &
+SERVER_PID=$!
+sleep 8          # client reconnect backoff + mirror + LIST
+kill -0 "$SERVER_PID" 2>/dev/null || { echo "ERROR: mirror server died, see /tmp/gpio-remote-server.log"; tail -3 /tmp/gpio-remote-server.log; exit 2; }
+check "ap_reset mirrored on connect"   bash -c "[ \"\$(cat $MNT/ap_reset/value)\" = 1 ]"
+rm -rf "$FAKE"
 
 # ---------------------------------------------------------------- summary
 echo "=== $PASS passed, $FAIL failed ==="

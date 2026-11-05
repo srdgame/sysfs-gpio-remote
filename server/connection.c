@@ -7,11 +7,13 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
 #include "connection.h"
+#include "gpio_backend.h"
 #include "proto_io.h"
 #include "log.h"
 
@@ -118,6 +120,64 @@ static uint16_t dispatch_request(const struct frame_header *req,
         if (req->payload_len != 0)
             return EINVAL;
         return 0;
+
+    case MSG_REQ_EXPORT_NAME: {
+        /* payload: [u8 name_len][name...] */
+        if (req->payload_len < 1)
+            return EINVAL;
+        uint8_t name_len = payload[0];
+        if (name_len < 1 || name_len > GPIO_NAME_MAX ||
+            req->payload_len != (size_t)name_len + 1)
+            return EINVAL;
+        char name[GPIO_NAME_MAX + 1];
+        memcpy(name, payload + 1, name_len);
+        name[name_len] = '\0';
+        for (int i = 0; i < name_len; i++) {
+            unsigned char c = (unsigned char)name[i];
+            if (c == '/' || !isprint(c))
+                return EINVAL;
+        }
+        int slot = -1;
+        int rc = pin_export_named(name, &slot);
+        if (rc == 0) {
+            uint32_t be = htonl((uint32_t)slot);
+            memcpy(resp, &be, 4);
+            *resp_len = 4;
+        }
+        return (uint16_t)rc;
+    }
+
+    case MSG_REQ_LIST: {
+        /* request empty; response [u16 count][{u32 pin, u8 len, name}...] */
+        if (req->payload_len != 0)
+            return EINVAL;
+        uint16_t count = 0;
+        size_t off = 2;
+        for (int i = 0; i < waiters_len; i++) {
+            char name[GPIO_NAME_MAX + 1];
+            if (!pin_is_exported(i))
+                continue;
+            if (pin_get_display_name(i, name, sizeof(name)) != 0)
+                continue;
+            size_t name_len = strlen(name);
+            if (off + 5 + name_len > FRAME_MAX_PAYLOAD) {
+                log_warn("connection: LIST truncated at %u entries", count);
+                break;
+            }
+            uint32_t be = htonl((uint32_t)i);
+            memcpy(resp + off, &be, 4);
+            off += 4;
+            resp[off++] = (uint8_t)name_len;
+            memcpy(resp + off, name, name_len);
+            off += name_len;
+            count++;
+        }
+        uint16_t be_count = htons(count);
+        memcpy(resp, &be_count, 2);
+        *resp_len = off;
+        return 0;
+    }
+
     default:
         return EINVAL;
     }
@@ -188,6 +248,11 @@ void connection_serve(int fd) {
     uint32_t expect_seq = 1;
 
     log_info("connection: client connected");
+
+    /* refresh the mirror of pre-existing named /sys/class/gpio entries so
+     * server-residue exports (and OpenWrt gpio-export pins) are listed to
+     * the client on every (re)connect */
+    backend_mirror_sysfs_named();
 
     while (1) {
         size_t cap = sizeof(payload);

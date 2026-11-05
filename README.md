@@ -11,6 +11,10 @@
 
 - **sysfs 兼容**：`export`/`unexport`/`direction`/`value`/`edge`/`active_low`
   语义与内核 `/sys/class/gpio` 一致
+- **命名引脚**：支持 OpenWrt `gpio-export` 风格命名导出（`echo pcie_on > export`）；
+  服务端 `/sys/class/gpio` 里预存的命名项在客户端连接时自动镜像到本地
+- **连接枚举**：客户端每次连接（含重连、重启）自动同步服务端已导出引脚，
+  恢复完整目录视图
 - **边沿检测**：对 `value` 文件 `poll(POLLPRI)` 即可等待远程边沿事件，
   服务端通过 epoll 监听 gpiod 事件并主动推送
 - **断线恢复**：客户端断线后自动指数退避重连（1s→10s），重连后自动重放
@@ -48,6 +52,10 @@ gpio-remote-server [-l ADDR] [-p PORT] [-n PINS] [-v]
 
 引脚编号 `gpioN` 映射到设备上名为 `GPION` 的线路（`gpiod` 线名查找）。
 例如 `gpio17` 需要 `gpioinfo` 能找到名为 `GPIO17` 的线。
+
+服务端每次客户端接入时会扫描 `/sys/class/gpio`，把预存的命名项（OpenWrt
+`gpio-export` 风格，内核驱动持有的引脚）自动镜像为仅 value 读写的命名引脚
+（测试可用环境变量 `GPIO_REMOTE_SYSFS_DIR` 覆盖扫描目录）。
 
 ### 客户端（本地主机）
 
@@ -100,6 +108,27 @@ EOF
 echo 17 > unexport        # 释放
 ```
 
+### 命名导出（OpenWrt gpio-export 风格）
+
+```bash
+cd ~/remote-gpio
+
+echo pcie_on > export     # 按名字导出（gpiod 线名，或服务端
+                          # /sys/class/gpio 里内核驱动持有的命名项）
+cat pcie_on/value         # 命名引脚始终可读写 value
+
+echo pcie_on > unexport   # 按名字释放
+```
+
+两种命名引脚形态：
+
+- **gpiod 线名**（如设备树 `gpio-line-names` 或 gpio-sim）：全功能，
+  direction/value/edge/active_low 均可用。
+- **内核驱动持有**（OpenWrt `gpio-export`，服务端 `/sys/class/gpio` 下的
+  符号链接目录）：仅 `value` 读写透传；设置 direction/edge/active_low 返回
+  `EINVAL`，unexport 只释放远程视图、不影响内核导出。服务端每次客户端
+  连接时自动把这类预存命名项镜像到客户端目录。
+
 ## 测试
 
 ```bash
@@ -107,15 +136,16 @@ make test                          # 协议单元测试（无需特权）
 sudo ./test/integration_test.sh    # gpio-sim 端到端测试（需 root）
 ```
 
-集成测试使用内核 `gpio-sim` 模块模拟 gpiochip（含 GPIO17/27 两条命名线），
-覆盖 export、方向切换、读写、active_low、POLLPRI 边沿、断线重连与状态重放。
+集成测试使用内核 `gpio-sim` 模块模拟 gpiochip（含 GPIO17/27/pcie_on 三条
+命名线），覆盖 export、命名导出、方向切换、读写、active_low、POLLPRI 边沿、
+断线重连与状态重放、连接枚举、`/sys/class/gpio` 自动镜像。
 要求内核启用 `CONFIG_GPIO_SIM=m`。
 
 ## 协议
 
 自定义二进制协议，16 字节帧头
 `[u32 magic "RGOI"][u16 type][u16 status][u32 seq][u32 payload_len]`，
-网络字节序，最大负载 64 字节。详见 `doc/DESIGN.md`。
+网络字节序，最大负载 512 字节。详见 `doc/DESIGN.md`。
 
 ## 已知限制
 

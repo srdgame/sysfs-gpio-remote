@@ -12,7 +12,10 @@
 
 #define FRAME_MAGIC         0x5247494Fu /* "RGOI" */
 #define FRAME_HEADER_SIZE   16
-#define FRAME_MAX_PAYLOAD   64
+#define FRAME_MAX_PAYLOAD   512
+
+/* longest GPIO name carried by the protocol (excluding '/') */
+#define GPIO_NAME_MAX       32
 
 /* message types */
 enum msg_type {
@@ -25,6 +28,8 @@ enum msg_type {
     MSG_REQ_SET_ACTIVE_LOW  = 7,
     MSG_REQ_POLL            = 8,
     MSG_REQ_PING            = 9,
+    MSG_REQ_EXPORT_NAME     = 10,
+    MSG_REQ_LIST            = 11,
     MSG_EDGE_EVENT          = 16,
 };
 
@@ -47,7 +52,10 @@ enum pin_edge {
 /* flags byte for MSG_REQ_POLL */
 #define MSG_POLL_F_NEW_SESSION  0x01  /* new poll session: drop stale pending edge */
 
-/* payload sizes per message type (0 = empty) */
+/* payload sizes per message type (0 = empty).
+ * MSG_REQ_EXPORT_NAME is variable: [u8 name_len][name...] (name_len 1..32).
+ * MSG_REQ_LIST is variable: request empty; response
+ * [u16 count][count × {u32 pin, u8 name_len, name}]. */
 static const size_t msg_payload_size[] = {
     [MSG_REQ_EXPORT]         = 4,   /* u32 pin */
     [MSG_REQ_UNEXPORT]       = 4,

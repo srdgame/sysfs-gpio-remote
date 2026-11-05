@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -22,9 +23,19 @@
 #include "edge_thread.h"
 #include "log.h"
 
+#define GPIO_DEFAULT_SYSFS_DIR "/sys/class/gpio"
+
+/* PB_GPIOD: full-featured pin driven via libgpiod.
+ * PB_SYSFS: value-only passthrough to /sys/class/gpio/<name>/value
+ * (kernel driver holds the pin, e.g. OpenWrt gpio-export). */
+enum pin_mode { PB_GPIOD, PB_SYSFS };
+
 struct pin_s {
     int n;
     bool in_use;
+    char name[33];          /* display name: "gpio%d" or requested name */
+    enum pin_mode mode;
+    char sysfs_value_path[PATH_MAX];    /* PB_SYSFS only */
     enum gpiod_line_direction direction;
     enum gpiod_line_edge edge;
     bool active_low;
@@ -36,6 +47,15 @@ struct pin_s {
 
 static struct pin_s *pins = NULL;
 static int num_pins = 0;
+
+/* Directory scanned for pre-existing named GPIO entries on client connect.
+ * GPIO_REMOTE_SYSFS_DIR overrides the default for tests. */
+static const char *backend_sysfs_dir(void) {
+    const char *dir = getenv("GPIO_REMOTE_SYSFS_DIR");
+    if (!dir || !*dir)
+        dir = GPIO_DEFAULT_SYSFS_DIR;
+    return dir;
+}
 
 /////////////////////////////////////////////////////////////////////
 
@@ -181,12 +201,18 @@ int pin_export(int n) {
     struct pin_s *pin = &pins[n];
     pthread_mutex_lock(&pin->lock);
     int ret = 0;
-    if (pin->in_use)
+    if (pin->in_use) {
+        /* idempotent when the slot already holds the numeric binding
+         * (reconnection replay); EBUSY when a named pin occupies it */
+        char expect[33];
+        snprintf(expect, sizeof(expect), "gpio%d", n);
+        ret = strcmp(pin->name, expect) == 0 ? 0 : EBUSY;
         goto out;
+    }
 
-    char name[20];
-    snprintf(name, sizeof(name), "GPIO%d", n);
-    if (!find_gpio_by_name(name, &pin->gpio_chip, &pin->gpio_line_offset)) {
+    char lookup[20];
+    snprintf(lookup, sizeof(lookup), "GPIO%d", n);
+    if (!find_gpio_by_name(lookup, &pin->gpio_chip, &pin->gpio_line_offset)) {
         ret = EBUSY;
         goto out;
     }
@@ -199,11 +225,146 @@ int pin_export(int n) {
         ret = EBUSY;
         goto out;
     }
+    pin->mode = PB_GPIOD;
+    snprintf(pin->name, sizeof(pin->name), "gpio%d", n);
     pin->in_use = true;
     log_info("backend: exported GPIO%d", n);
 out:
     pthread_mutex_unlock(&pin->lock);
     return ret;
+}
+
+/* Validate a requested pin name: 1..32 printable chars, no '/'. */
+static int pin_name_valid(const char *name) {
+    size_t len = strlen(name);
+    if (len < 1 || len > 32)
+        return 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '/' || !isprint(c))
+            return 0;
+    }
+    return 1;
+}
+
+/* Bind a validated name to slot `slot` and mark it in_use.
+ * Called with pin->lock held. Returns 0 or errno. */
+static int pin_bind_named(struct pin_s *pin, const char *name) {
+    char path[PATH_MAX];
+
+    /* 1) gpiod line lookup -> full-featured pin */
+    if (find_gpio_by_name(name, &pin->gpio_chip, &pin->gpio_line_offset)) {
+        pin->direction = GPIOD_LINE_DIRECTION_INPUT;
+        pin->edge = GPIOD_LINE_EDGE_NONE;
+        pin->active_low = false;
+        pin->gpio_line_request = NULL;
+        if (pin_reconfigure_line(pin)) {
+            pin->mode = PB_GPIOD;
+            snprintf(pin->name, sizeof(pin->name), "%s", name);
+            pin->in_use = true;
+            log_info("backend: exported %s (gpiod)", name);
+            return 0;
+        }
+        /* line exists but is held by someone else; fall through to sysfs */
+        log_debug("backend: gpiod request for %s failed (%s)",
+                  name, strerror(errno));
+    }
+
+    /* 2) sysfs passthrough (named export held by a kernel driver) */
+    snprintf(path, sizeof(path), "%s/%s/value", backend_sysfs_dir(), name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return errno == ENOENT ? ENOENT : errno;
+    close(fd);
+    pin->mode = PB_SYSFS;
+    snprintf(pin->sysfs_value_path, sizeof(pin->sysfs_value_path), "%s", path);
+    snprintf(pin->name, sizeof(pin->name), "%s", name);
+    pin->in_use = true;
+    log_info("backend: exported %s (sysfs passthrough)", name);
+    return 0;
+}
+
+int pin_export_named(const char *name, int *slot_out) {
+    if (!pin_name_valid(name))
+        return EINVAL;
+
+    /* idempotent: an existing binding with the same name wins */
+    for (int i = 0; i < num_pins; i++) {
+        struct pin_s *pin = &pins[i];
+        pthread_mutex_lock(&pin->lock);
+        bool hit = pin->in_use && strcmp(pin->name, name) == 0;
+        int slot = i;
+        pthread_mutex_unlock(&pin->lock);
+        if (hit) {
+            *slot_out = slot;
+            return 0;
+        }
+    }
+
+    /* find a free slot */
+    int slot = -1;
+    for (int i = 0; i < num_pins; i++) {
+        pthread_mutex_lock(&pins[i].lock);
+        bool free = !pins[i].in_use;
+        pthread_mutex_unlock(&pins[i].lock);
+        if (free) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        log_warn("backend: no free slot for named export %s", name);
+        return ENOMEM;
+    }
+
+    struct pin_s *pin = &pins[slot];
+    pthread_mutex_lock(&pin->lock);
+    if (pin->in_use) {      /* raced (should not happen: dispatch is serial) */
+        pthread_mutex_unlock(&pin->lock);
+        return EBUSY;
+    }
+    int ret = pin_bind_named(pin, name);
+    pthread_mutex_unlock(&pin->lock);
+    if (ret == 0)
+        *slot_out = slot;
+    return ret;
+}
+
+static bool sysfs_name_skip(const char *name) {
+    if (strcmp(name, "export") == 0 || strcmp(name, "unexport") == 0)
+        return true;
+    if (strncmp(name, "gpiochip", 8) == 0)
+        return true;
+    /* skip numeric gpioN entries (owned by the numeric export path) */
+    if (strncmp(name, "gpio", 4) != 0)
+        return false;
+    if (!isdigit((unsigned char)name[4]))
+        return false;
+    for (const char *p = name + 4; *p; p++)
+        if (!isdigit((unsigned char)*p))
+            return false;
+    return true;
+}
+
+void backend_mirror_sysfs_named(void) {
+    const char *dir = backend_sysfs_dir();
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (sysfs_name_skip(e->d_name))
+            continue;
+        int slot = -1;
+        int ret = pin_export_named(e->d_name, &slot);
+        if (ret == 0)
+            log_info("backend: mirrored sysfs entry %s (slot %d)",
+                     e->d_name, slot);
+        else if (ret != ENOENT)
+            log_warn("backend: cannot mirror sysfs entry %s: %s",
+                     e->d_name, strerror(ret));
+    }
+    closedir(d);
 }
 
 int pin_unexport(int n) {
@@ -212,6 +373,15 @@ int pin_unexport(int n) {
         return chk;
     struct pin_s *pin = &pins[n];
     pthread_mutex_lock(&pin->lock);
+    if (pin->mode == PB_SYSFS) {
+        /* value-only pin: release the slot, leave the kernel export alone */
+        char name[33];
+        snprintf(name, sizeof(name), "%s", pin->name);
+        pin->in_use = false;
+        pthread_mutex_unlock(&pin->lock);
+        log_info("backend: unexported %s (sysfs slot released)", name);
+        return 0;
+    }
     if (pin->edge != GPIOD_LINE_EDGE_NONE)
         edge_thread_remove_pin(pin->gpio_line_request);
     gpiod_line_request_release(pin->gpio_line_request);
@@ -233,6 +403,8 @@ int pin_set_direction(int n, uint8_t dir) {
     if (chk != 0)
         return chk;
     struct pin_s *pin = &pins[n];
+    if (pin->mode == PB_SYSFS)
+        return EINVAL;
     pthread_mutex_lock(&pin->lock);
     enum gpiod_line_direction d = GPIOD_LINE_DIRECTION_INPUT;
     int initial = -1;
@@ -263,6 +435,8 @@ int pin_set_edge(int n, uint8_t edge) {
     if (chk != 0)
         return chk;
     struct pin_s *pin = &pins[n];
+    if (pin->mode == PB_SYSFS)
+        return EINVAL;
     pthread_mutex_lock(&pin->lock);
     enum gpiod_line_edge e;
     switch (edge) {
@@ -293,6 +467,8 @@ int pin_set_active_low(int n, uint8_t val) {
     if (chk != 0)
         return chk;
     struct pin_s *pin = &pins[n];
+    if (pin->mode == PB_SYSFS)
+        return EINVAL;
     pthread_mutex_lock(&pin->lock);
     bool al = (val != 0);
     int ret = 0;
@@ -305,18 +481,54 @@ int pin_set_active_low(int n, uint8_t val) {
     return ret;
 }
 
+/* sysfs passthrough: write "0"/"1" to the value file; errno from the
+ * syscall is returned as-is (input-only value files surface EACCES). */
+static int sysfs_set_value(const struct pin_s *pin, uint8_t value) {
+    int fd = open(pin->sysfs_value_path, O_WRONLY);
+    if (fd < 0)
+        return errno;
+    char buf = value ? '1' : '0';
+    ssize_t w = write(fd, &buf, 1);
+    int ret = (w == 1) ? 0 : (w < 0 ? errno : EIO);
+    if (close(fd) != 0 && ret == 0)
+        ret = errno;
+    return ret;
+}
+
+/* sysfs passthrough: read one "0"/"1" from the value file. */
+static int sysfs_get_value(const struct pin_s *pin, uint8_t *value_out) {
+    int fd = open(pin->sysfs_value_path, O_RDONLY);
+    if (fd < 0)
+        return errno;
+    char buf[8];
+    ssize_t r = read(fd, buf, sizeof(buf));
+    int ret = 0;
+    if (r < 0)
+        ret = errno;
+    else if (r == 0)
+        ret = EIO;
+    else
+        *value_out = buf[0] == '0' ? 0 : 1;
+    if (close(fd) != 0 && ret == 0)
+        ret = errno;
+    return ret;
+}
+
 int pin_set_value(int n, uint8_t value) {
     int chk = check_pin(n, true);
     if (chk != 0)
         return chk;
     struct pin_s *pin = &pins[n];
     pthread_mutex_lock(&pin->lock);
-    int ret = 0;
-    if (pin->direction != GPIOD_LINE_DIRECTION_OUTPUT) {
+    int ret;
+    if (pin->mode == PB_SYSFS) {
+        ret = sysfs_set_value(pin, value);
+    } else if (pin->direction != GPIOD_LINE_DIRECTION_OUTPUT) {
         ret = EPERM;
     } else {
         gpiod_line_request_set_value(pin->gpio_line_request,
                                      pin->gpio_line_offset, value ? 1 : 0);
+        ret = 0;
     }
     pthread_mutex_unlock(&pin->lock);
     return ret;
@@ -328,10 +540,27 @@ int pin_get_value(int n, uint8_t *value_out) {
         return chk;
     struct pin_s *pin = &pins[n];
     pthread_mutex_lock(&pin->lock);
+    int ret;
+    if (pin->mode == PB_SYSFS) {
+        ret = sysfs_get_value(pin, value_out);
+        pthread_mutex_unlock(&pin->lock);
+        return ret;
+    }
     int value = gpiod_line_request_get_value(pin->gpio_line_request,
                                              pin->gpio_line_offset);
     pthread_mutex_unlock(&pin->lock);
     *value_out = (uint8_t)value;
+    return 0;
+}
+
+int pin_get_display_name(int n, char *buf, size_t size) {
+    int chk = check_pin(n, true);
+    if (chk != 0)
+        return chk;
+    struct pin_s *pin = &pins[n];
+    pthread_mutex_lock(&pin->lock);
+    snprintf(buf, size, "%s", pin->name);
+    pthread_mutex_unlock(&pin->lock);
     return 0;
 }
 

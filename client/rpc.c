@@ -343,3 +343,69 @@ void rpc_shutdown(void) {
     pthread_mutex_unlock(&rpc.sock_lock);
     pthread_join(rpc.reconnect_thread, NULL);
 }
+
+int rpc_export_name(const char *name, int *slot_out) {
+    size_t name_len = strlen(name);
+    if (name_len < 1 || name_len > GPIO_NAME_MAX)
+        return EINVAL;
+
+    uint8_t payload[1 + GPIO_NAME_MAX];
+    payload[0] = (uint8_t)name_len;
+    memcpy(payload + 1, name, name_len);
+
+    uint8_t resp[FRAME_MAX_PAYLOAD];
+    size_t resp_len = sizeof(resp);
+    uint16_t status = 0;
+    int rc = rpc_call(MSG_REQ_EXPORT_NAME, payload, name_len + 1,
+                      resp, &resp_len, &status);
+    if (rc != 0)
+        return rc;
+    if (status != 0)
+        return status;
+    if (resp_len != 4)
+        return EPROTO;
+    uint32_t be;
+    memcpy(&be, resp, 4);
+    uint32_t slot = ntohl(be);
+    if (slot >= (uint32_t)rpc.num_pins)
+        return EPROTO;
+    *slot_out = (int)slot;
+    return 0;
+}
+
+int rpc_list(rpc_list_cb_t cb, void *ctx) {
+    uint8_t resp[FRAME_MAX_PAYLOAD];
+    size_t resp_len = sizeof(resp);
+    uint16_t status = 0;
+    int rc = rpc_call(MSG_REQ_LIST, NULL, 0, resp, &resp_len, &status);
+    if (rc != 0)
+        return rc;
+    if (status != 0)
+        return status;
+    if (resp_len < 2)
+        return EPROTO;
+
+    uint16_t be_count;
+    memcpy(&be_count, resp, 2);
+    uint16_t count = ntohs(be_count);
+
+    size_t off = 2;
+    for (uint16_t i = 0; i < count; i++) {
+        if (off + 5 > resp_len)
+            return EPROTO;
+        uint32_t be_pin;
+        memcpy(&be_pin, resp + off, 4);
+        uint32_t pin = ntohl(be_pin);
+        off += 4;
+        uint8_t name_len = resp[off++];
+        if (name_len > GPIO_NAME_MAX || off + name_len > resp_len)
+            return EPROTO;
+        char name[GPIO_NAME_MAX + 1];
+        memcpy(name, resp + off, name_len);
+        name[name_len] = '\0';
+        off += name_len;
+        if (cb(pin, name, ctx) != 0)
+            break;
+    }
+    return 0;
+}

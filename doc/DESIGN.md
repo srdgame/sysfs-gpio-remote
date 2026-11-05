@@ -13,6 +13,8 @@
 | R3 | 客户端对 GPIO 文件的任何读/写实时转发到服务端执行 |
 | R4 | 通信使用 TCP 套接字 |
 | R5 | 支持边沿检测：客户端 `poll()` gpioN/value 的 POLLPRI 机制，服务端边沿事件异步推送 |
+| R6 | 命名 GPIO：支持 OpenWrt `gpio-export` 风格命名引脚（内核驱动持有 → 仅 value 透传；gpiod 线名 → 全功能） |
+| R7 | 连接时枚举：客户端每次连接查询服务端已导出引脚，补齐本地视图（含服务端残留与预存命名项自动镜像） |
 
 ### 1.2 已确认的设计决策
 
@@ -25,18 +27,23 @@
 | 挂载点 | 两者都支持：默认自定义目录，可用参数 shadow `/sys/class/gpio` |
 | 并发连接 | 服务端单客户端（第二个连接被拒绝） |
 | 引脚映射 | 客户端 gpioN 直接映射服务端 GPIO 名 `GPION` |
+| 命名引脚（内核持有） | 仅 value 读写（sysfs 透传），direction/edge/active_low 返回 EINVAL |
+| 命名引脚（gpiod 线名） | 全功能；本地目录名 = 请求名（如 `pcie_on`） |
+| 枚举时机 | 每次连接（含重连）都执行 REQ_LIST；服务端同时重新镜像 `/sys/class/gpio` 预存命名项 |
 | 仓库结构 | 单仓库双目标，共享协议头 |
 
 ### 1.3 支持的 sysfs 接口（与参考项目一致）
 
 ```
-/export                    写入引脚号导出
-/unexport                  写入引脚号取消导出
-/gpioN/                    导出后的引脚目录
+/export                    写入引脚号导出（数字编号，或命名导出，见 §4.2.1）
+/unexport                  写入引脚号取消导出（数字编号或名字）
+/gpioN/                    数字导出后的引脚目录
 /gpioN/value               读/写电平；poll() 支持 POLLPRI 边沿唤醒
 /gpioN/direction           in / out / low / high
 /gpioN/edge                none / rising / falling / both
 /gpioN/active_low          0 / 1
+/<name>/                   命名导出后的引脚目录（目录名 = 请求名）
+/<name>/value              命名引脚的 value；内核持有的引脚仅此文件可用
 ```
 
 ## 2. 总体架构
@@ -121,7 +128,36 @@ struct frame_header {
 | 7 | C→S | REQ_SET_ACTIVE_LOW | `u32 pin, u8 val` | 空 |
 | 8 | C→S | REQ_POLL | `u32 pin, u8 flags` | `u8 edge_detected` |
 | 9 | C→S | REQ_PING | 空 | 空 |
+| 10 | C→S | REQ_EXPORT_NAME | `u8 name_len, name[1..32]` | `u32 slot` |
+| 11 | C→S | REQ_LIST | 空 | `u16 count, count × {u32 pin, u8 name_len, name}` |
 | 16 | S→C | MSG_EDGE_EVENT | `u32 pin` | —（异步） |
+
+payload 上限 `FRAME_MAX_PAYLOAD = 512`；名称最长 `GPIO_NAME_MAX = 32`
+（可打印字符，不含 `/`）。`REQ_LIST` 响应超出 512 字节时截断（服务端打 WARN），
+典型设备命名引脚数远低于该容量。
+
+### 4.2.1 命名 GPIO 与槽位模型
+
+服务端每个引脚槽位（0..num_pins-1）有显示名 `gpio%d` 或请求的导出名，以及
+两种模式：
+
+- **PB_GPIOD**（全功能）：数字导出按线名 `GPIO%d` 查找；命名导出按任意
+  gpiod 线名查找（覆盖 `gpio-line-names` 与 gpio-sim）。
+- **PB_SYSFS**（仅 value）：当名字不是 gpiod 线名但
+  `<sysfs_dir>/<name>/value` 存在时（OpenWrt `gpio-export` 风格，内核驱动
+  持有引脚），直接读写该 sysfs 文件。`direction`/`edge`/`active_low` 设置
+  返回 `EINVAL`；`unexport` 仅释放槽位，不解除内核导出。
+
+- **连接时枚举（REQ_LIST）**：客户端每次（重）连接先 `REQ_LIST`，对服务器
+  已导出而本地未导出的槽位补齐本地视图（覆盖服务器残留导出与客户端重启后
+  恢复），随后再执行本地状态的恢复重放。两个方向合并：LIST 补服务器残留，
+  重放恢复服务器重启后的本地引脚。本地已导出的槽位以客户端自身状态为准。
+- **连接时镜像**：服务端在每次客户端接入时扫描
+  `${GPIO_REMOTE_SYSFS_DIR:-/sys/class/gpio}`（环境变量仅用于测试），把
+  预存的命名项（跳过 `export`/`unexport`/`gpiochip*`/`gpioN`）自动导出为
+  PB_SYSFS 槽位。
+- **幂等性**：重复导出同名（数字或命名）成功返回原槽位；数字导出撞上已被
+  命名引脚占用的槽位返回 `EBUSY`。重连重放依赖此幂等性。
 
 枚举值：
 
@@ -141,6 +177,10 @@ MSG_POLL_F_NEW_SESSION = 0x01
   - unexport 未导出的引脚 → `EINVAL`
   - 写 value 到输入方向引脚 → `EPERM`
   - 非法 direction/edge 字符串 → `EINVAL`
+  - 命名导出：名字非法（超长/含非可打印或 `/`）→ `EINVAL`；既非 gpiod 线名
+    也无对应 sysfs value 文件 → `ENOENT`；无空闲槽位 → `ENOMEM`
+  - 命名引脚（PB_SYSFS）：设置 direction/edge/active_low → `EINVAL`；value
+    文件只读（输入模式引脚）→ `EACCES`
 - **串行模型**：客户端同一时刻只有一个在途请求；`seq` 单调递增，服务端校验（防御性），不匹配视为协议错误断开连接。
 - **异步事件**：`MSG_EDGE_EVENT` 可在任意时刻到达，客户端接收线程独立处理，不打断请求-响应配对。
 - **REQ_POLL 语义**（对应参考项目 `pin_poll_edge`）：
@@ -190,13 +230,22 @@ cleanup: 注销本连接所有 poll 订阅, 关闭连接
 ```c
 int  backend_init(int num_pins);          // 扫描 gpiochip、初始化 pins[]、启动边沿线程
 int  pin_export(int n);                   // 查找 "GPION" → gpiod line request
-int  pin_unexport(int n);
-int  pin_set_direction(int n, uint8_t d);
-int  pin_set_edge(int n, uint8_t e);
-int  pin_set_active_low(int n, uint8_t v);
-int  pin_set_value(int n, uint8_t v);
-int  pin_get_value(int n, uint8_t *out);
+int  pin_export_named(const char *name, int *slot_out);
+                                          // gpiod 线名 → 全功能；否则
+                                          // <sysfs_dir>/<name>/value 存在 → PB_SYSFS；
+                                          // 否则 ENOENT；幂等（同名返回原槽位）
+void backend_mirror_sysfs_named(void);    // 镜像 /sys/class/gpio 预存命名项
+int  pin_unexport(int n);                 // PB_SYSFS 仅释放槽位
+int  pin_set_direction(int n, uint8_t d); // PB_SYSFS → EINVAL
+int  pin_set_edge(int n, uint8_t e);      // PB_SYSFS → EINVAL
+int  pin_set_active_low(int n, uint8_t v);// PB_SYSFS → EINVAL
+int  pin_set_value(int n, uint8_t v);     // PB_SYSFS 直接写 value 文件
+int  pin_get_value(int n, uint8_t *out);  // PB_SYSFS 直接读 value 文件
+int  pin_get_display_name(int n, char *buf, size_t size); // 供 REQ_LIST
 ```
+
+镜像目录可用环境变量 `GPIO_REMOTE_SYSFS_DIR` 覆盖（仅测试用，默认
+`/sys/class/gpio`）。
 
 保留参考实现的关键行为：
 - `find_gpio_by_name("GPION")` 遍历 chip 查找（支持 BCM 编号）
@@ -232,13 +281,13 @@ gpio-remote-client -s 192.168.1.50 /sys/class/gpio -o allow_other,default_permis
 
 | FUSE 回调 | 行为 |
 |-----------|------|
-| getattr | `/`、`/export`、`/unexport`、`/gpioN`（已导出才可见）、`/gpioN/{value,direction,edge,active_low}`；权限位与参考一致（export/unexport 0220，属性文件 0660，目录 0755） |
-| readdir | 根目录列出 export/unexport/已导出 gpioN；gpioN 目录列出四个属性文件 |
+| getattr | `/`、`/export`、`/unexport`、`/gpioN` 或 `/<name>`（已导出才可见）、`/<pin>/{value,direction,edge,active_low}`；权限位与参考一致（export/unexport 0220，属性文件 0660，目录 0755） |
+| readdir | 根目录列出 export/unexport/已导出引脚（数字用 `gpioN`，命名用请求名）；引脚目录列出四个属性文件 |
 | open | 路径合法性校验（同参考）；`direct_io = 1` |
 | read | 按 offset 0 触发 `REQ_GET_VALUE` 并缓存到 file handle 的 16 字节 buf（参考的 `buf_update_maybe` 语义） |
-| write | 解析文本 → 对应 REQ_SET_*；export/unexport 写入数字 → REQ_EXPORT/UNEXPORT |
+| write | 解析文本 → 对应 REQ_SET_*；export/unexport 写入数字 → REQ_EXPORT/UNEXPORT，写入名字（≤32 字符）→ REQ_EXPORT_NAME / 按名查找后 UNEXPORT |
 | release | 释放 file handle，注销 poll 订阅 |
-| poll | 仅 `/gpioN/value` 支持；流程见 §4.3；客户端本地维护 `edge_detected` 标志与 waiter 表 |
+| poll | 仅 `/<pin>/value` 支持；流程见 §4.3；客户端本地维护 `edge_detected` 标志与 waiter 表 |
 | flush/fsync 等 | 不需要，返回 0 |
 
 文本解析复用参考项目的 `str_buf_equal`（容忍尾随换行、`direction` 支持 `low/high` 即设置初始电平）。
@@ -263,6 +312,7 @@ int rpc_is_connected(void);
 ```c
 typedef struct {
     bool        exported;
+    char        name[33];       // "gpio%d" 或命名导出的请求名
     uint8_t     direction;      // 最后一次设置的 direction
     uint8_t     edge;
     uint8_t     active_low;
@@ -270,11 +320,18 @@ typedef struct {
 } pin_state_t;
 ```
 
-**重连恢复流程**（重连成功后，由 state 层串行重放）：
+**重连恢复流程**（每次连接成功后，由 state 层串行执行）：
 
-1. 对每个 `exported` 引脚：`REQ_EXPORT` → `REQ_SET_DIRECTION` → `REQ_SET_EDGE` → `REQ_SET_ACTIVE_LOW` → （若 out）`REQ_SET_VALUE(last_value)`
-2. 某一步失败（如引脚已被服务端其他用途占用）→ 该引脚标记 `exported=false` 并向日志告警，后续访问返回 `EIO`
-3. 恢复完成前，新到的 RPC 一律排队等待（有 10s 上限，超时返回 EIO）
+1. **先 `REQ_LIST`**：对服务端已导出而本地未导出的槽位，按服务端返回的名字
+   补齐本地视图（覆盖服务端残留导出、客户端重启后的视图恢复；本地已导出的
+   槽位以客户端自身状态为准）
+2. **再重放**：对每个本地 `exported` 引脚——数字名（`gpioN`）走
+   `REQ_EXPORT`；命名走 `REQ_EXPORT_NAME`（服务端分配的槽位若与本地不同，
+   本地条目迁移到新槽位）→ `REQ_SET_DIRECTION` → `REQ_SET_EDGE` →
+   `REQ_SET_ACTIVE_LOW` → （若 out）`REQ_SET_VALUE(last_value)`
+3. 某一步失败（如引脚已被服务端其他用途占用）→ 该引脚标记 `exported=false` 并向日志告警，后续访问返回 `EIO`
+4. 恢复完成前，新到的 RPC 一律排队等待（有 10s 上限，超时返回 EIO）；快速
+   重连时旧恢复线程被新一代序号取代，不再改动引脚状态
 
 **断线期间的语义**：
 
@@ -352,3 +409,7 @@ make clean
 - 服务端不支持多客户端并发
 - 不模拟参考项目未实现的属性（如 `/device`、bias 设置）
 - 性能以 RTT 为下限（LAN 典型 <1ms/操作），不针对高频率翻转优化
+- REQ_LIST 响应受 512 字节负载上限约束，约 70+ 个同时导出引脚时截断
+  （服务端打 WARN；典型设备远低于此规模）
+- 数字导出（`echo N > export`）撞上已被自动镜像占用的槽位 → `EBUSY`；
+  命名引脚请按名字导出

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <assert.h>
 #include <pthread.h>
@@ -59,23 +60,46 @@ typedef struct {
 
 static int num_pins = 0;
 
-/* mirror of shim's gpio_file(): parse "/gpioN[/suffix]" */
+/* mirror of shim's gpio_file(): parse "/gpioN[/suffix]" or "/name[/suffix]"
+ * for named exports */
 static gpio_file_t *gpio_file(const char *path) {
-    if (!str_startswith(path, "/gpio"))
-        return NULL;
-    const char *p_start = path + 5;
-    char *p_end = NULL;
-    long int p = strtol(p_start, &p_end, 10);
-    if (p_start == p_end || p < 0 || p >= num_pins)
-        return NULL;
-    if (!state_is_exported((int)p))
+    int pin = -1;
+    const char *rest = NULL;
+
+    if (str_startswith(path, "/gpio")) {
+        /* numeric fast path */
+        const char *p_start = path + 5;
+        char *p_end = NULL;
+        long int p = strtol(p_start, &p_end, 10);
+        if (p_start != p_end && p >= 0 && p < num_pins) {
+            pin = (int)p;
+            rest = p_end;
+        }
+    }
+    if (pin < 0) {
+        /* named export: first path component resolved via state */
+        if (path[0] != '/')
+            return NULL;
+        const char *end = strchr(path + 1, '/');
+        size_t name_len = end ? (size_t)(end - path - 1) : strlen(path + 1);
+        if (name_len < 1 || name_len > GPIO_NAME_MAX)
+            return NULL;
+        char name[GPIO_NAME_MAX + 1];
+        memcpy(name, path + 1, name_len);
+        name[name_len] = '\0';
+        pin = state_find_by_name(name);
+        if (pin < 0)
+            return NULL;
+        rest = end ? end : path + strlen(path);
+    }
+    if (!state_is_exported(pin))
         return NULL;
 
     gpio_file_t *file = calloc(1, sizeof(*file));
     if (!file)
         return NULL;
-    file->pin = (int)p;
-    file->suffix = *p_end == '\0' ? NULL : strdup(p_end);
+    file->pin = pin;
+    file->suffix = *rest == '\0' ? NULL : strdup(rest);
     return file;
 }
 
@@ -96,6 +120,24 @@ static int pin_from_num(const char *buf, size_t size, int *pin_out) {
     if (end == tmp || p < 0 || p >= num_pins)
         return 0;
     *pin_out = (int)p;
+    return 1;
+}
+
+/* Parse a pin name from an export/unexport write ("pcie_on\n").
+ * Returns 1 and fills out (NUL-terminated) on success. */
+static int name_from_buf(const char *buf, size_t size,
+                         char *out, size_t out_size) {
+    if (size > 0 && buf[size - 1] == '\n')
+        size--;
+    if (size < 1 || size > GPIO_NAME_MAX || size >= out_size)
+        return 0;
+    for (size_t i = 0; i < size; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '/' || !isprint(c))
+            return 0;
+    }
+    memcpy(out, buf, size);
+    out[size] = '\0';
     return 1;
 }
 
@@ -268,8 +310,8 @@ static int gpio_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         for (int p = 0; p < num_pins; p++) {
             if (!state_is_exported(p))
                 continue;
-            char name[16];
-            snprintf(name, sizeof(name), "gpio%d", p);
+            char name[64];
+            state_name_of(p, name, sizeof(name));
             filler(buf, name, NULL, 0, 0);
         }
         return 0;
@@ -376,18 +418,37 @@ static int gpio_write(const char *path, const char *buf, size_t size,
     (void)offset;
     if (str_equal(path, "/export")) {
         int pin;
-        if (!pin_from_num(buf, size, &pin))
+        if (pin_from_num(buf, size, &pin)) {
+            int rc = rpc_pin_call(MSG_REQ_EXPORT, pin, -1);
+            if (rc != 0)
+                return -rc;
+            /* idempotent re-export: keep the cached pin config */
+            if (!state_is_exported(pin))
+                state_on_export(pin);
+            return (int)size;
+        }
+        /* named export (OpenWrt gpio-export style) */
+        char name[GPIO_NAME_MAX + 1];
+        if (!name_from_buf(buf, size, name, sizeof(name)))
             return -EINVAL;
-        int rc = rpc_pin_call(MSG_REQ_EXPORT, pin, -1);
+        int slot = -1;
+        int rc = rpc_export_name(name, &slot);
         if (rc != 0)
             return -rc;
-        state_on_export(pin);
+        if (!state_is_exported(slot))
+            state_on_export_named(slot, name);
         return (int)size;
     }
     if (str_equal(path, "/unexport")) {
         int pin;
-        if (!pin_from_num(buf, size, &pin))
-            return -EINVAL;
+        if (!pin_from_num(buf, size, &pin)) {
+            char name[GPIO_NAME_MAX + 1];
+            if (!name_from_buf(buf, size, name, sizeof(name)))
+                return -EINVAL;
+            pin = state_find_by_name(name);
+            if (pin < 0)
+                return -ENOENT;
+        }
         int rc = rpc_pin_call(MSG_REQ_UNEXPORT, pin, -1);
         if (rc != 0)
             return -rc;

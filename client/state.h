@@ -10,6 +10,7 @@
 
 struct pin_state {
     bool exported;
+    char name[33];       /* "gpio%d" or a requested named export */
     uint8_t direction;
     uint8_t edge;
     uint8_t active_low;
@@ -21,6 +22,13 @@ void state_init(int num_pins);
 
 /* Track successful operations so reconnection can replay them. */
 void state_on_export(int pin);
+
+/*
+ * Record a successful named export bound to server slot `pin`.
+ * On reconnection, named pins are replayed via MSG_REQ_EXPORT_NAME.
+ */
+void state_on_export_named(int pin, const char *name);
+
 void state_on_unexport(int pin);
 void state_on_direction(int pin, uint8_t dir);
 void state_on_edge(int pin, uint8_t edge);
@@ -36,6 +44,12 @@ int state_wait_ready(void);
 
 /* Whether pin was exported through this client (local view). */
 bool state_is_exported(int pin);
+
+/* Find a locally exported pin by name; -1 if not found. */
+int state_find_by_name(const char *name);
+
+/* Copy the FUSE directory entry name ("gpio%d" or export name). */
+void state_name_of(int pin, char *buf, size_t size);
 
 /* Cached attribute reads (client mirrors server state; single client). */
 uint8_t state_get_direction(int pin);
