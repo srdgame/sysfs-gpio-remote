@@ -1,0 +1,15 @@
+# build artifacts
+*.o
+*.d
+gpio-remote-server
+gpio-remote-client
+test/proto_test
+test/poll_helper
+
+# editor / tooling
+tags
+.claude/
+
+# editor backups
+*~
+*.un~
